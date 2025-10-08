@@ -16,6 +16,10 @@
 # Mono auto generated files
 mono_crash.*
 
+/src/engine/TexColumns/Common/
+/src/engine/TexColumns/Scenes/
+/src/engine/TexColumns/Textures/
+
 # Build results
 [Dd]ebug/
 [Dd]ebugPublic/
@@ -82,8 +86,6 @@ StyleCopReport.xml
 *.pgc
 *.pgd
 *.rsp
-# but not Directory.Build.rsp, as it configures directory-level build defaults
-!Directory.Build.rsp
 *.sbr
 *.tlb
 *.tli
@@ -155,7 +157,6 @@ coverage*.info
 
 # NCrunch
 _NCrunch_*
-.NCrunch_*
 .*crunch*.local.xml
 nCrunchTemp_*
 

@@ -1,0 +1,8 @@
+#comment
+
+obj suzanne suzanne texture 20 20 20 0 3.14 0 0 5 -20
+obj suzanne2 suzanne texture 10 10 10 0 3.14 0 20 5 -20
+
+obj suzanne3 suzanne checkboard 20 20 20 0 3.14 0 0 -35 -0
+obj will will checkboard 50 50 50 0 0 0 0 -14 0
+obj ground customgrid bricks 50 1 50 0 0 0 0 -10 0

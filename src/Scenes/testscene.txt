@@ -1,0 +1,9 @@
+#comment
+
+#obj suzanne suzanne texture 10 10 10 0 3.14 0 0 5 -20
+#obj suzanne2 suzanne texture 10 10 10 0 3.14 0 20 5 -20
+
+obj ground customgrid bricks 50 1 50 0 0 0 0 -10 0
+obj ground customgrid bricks 50 1 50 0 0 0 100 -10 0
+obj ground customgrid bricks 50 1 50 0 0 0 0 -10 100
+obj ground customgrid bricks 50 1 50 0 0 0 100 -10 100
