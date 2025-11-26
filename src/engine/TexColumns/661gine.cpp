@@ -12,6 +12,10 @@
 #include "FrameResource.h"
 #include <DirectXCollision.h>
 
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx12.h"
+
 #include "d3dhelpers.h"
 #include <iostream>
 
@@ -22,7 +26,7 @@
 //#define DEBUG
 #define SKYPASS
 #define PBR
-#define OLDMAP
+//#define OLDMAP
 //#define DEFERREDQUADS
 
 Camera cam;
@@ -105,6 +109,46 @@ struct Particle
 };
 static_assert(sizeof(Particle) % 16 == 0, "aligned");
 
+static void CreateSolidArray1x1U32(
+    ID3D12Device* dev, ID3D12GraphicsCommandList* cmd,
+    DXGI_FORMAT fmt, uint32_t rgba8888,
+    Microsoft::WRL::ComPtr<ID3D12Resource>& outTex)
+{
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = 1; td.Height = 1;
+    td.DepthOrArraySize = 1; // 1 slice в массиве
+    td.MipLevels = 1;
+    td.Format = fmt;
+    td.SampleDesc = {1,0};
+    td.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    ThrowIfFailed(dev->CreateCommittedResource(
+        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+        D3D12_HEAP_FLAG_NONE, &td,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+        IID_PPV_ARGS(&outTex)));
+
+    UINT64 uploadSize = GetRequiredIntermediateSize(outTex.Get(), 0, 1);
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+    ThrowIfFailed(dev->CreateCommittedResource(
+        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+        D3D12_HEAP_FLAG_NONE,
+        &CD3DX12_RESOURCE_DESC::Buffer(uploadSize),
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        IID_PPV_ARGS(&upload)));
+
+    D3D12_SUBRESOURCE_DATA sub{};
+    sub.pData = &rgba8888; sub.RowPitch = 4; sub.SlicePitch = 4;
+    UpdateSubresources(cmd, outTex.Get(), upload.Get(), 0, 0, 1, &sub);
+
+    auto toSRV = CD3DX12_RESOURCE_BARRIER::Transition(
+        outTex.Get(),
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE); // TODO
+    cmd->ResourceBarrier(1, &toSRV);
+}
+
 class TexColumnsApp : public D3DApp
 {
 public:
@@ -170,6 +214,12 @@ private:
 	void BuildEnvPSO();
 	void BuildEnvRootSignature();
 
+	void BuildTerrainRootSignature();
+	void BuildTerrainGBufferPSO();
+	void BuildTerrainGridGeometry(int gridRes);
+	void BuildTerrainDescriptorsAndPlaceholders();
+	void BuildTerrainSkirtGeometry(int gridRes);
+
 	void BuildParticleResources();
 	void BuildParticleDescriptors();
 	void BuildParticleCS_RS();
@@ -234,6 +284,46 @@ private:
 	std::unordered_map<std::string, std::unique_ptr<Texture>> mTextures;
 	std::unordered_map<std::string, ComPtr<ID3DBlob>> mShaders;
 	std::unordered_map<std::string, ComPtr<ID3D12PipelineState>> mPSOs;
+
+	//=================================================================TERRAIN
+	ComPtr<ID3D12RootSignature> mTerrainRootSignature = nullptr;
+	ComPtr<ID3D12PipelineState> mTerrainGBufferPSO = nullptr;
+	ComPtr<ID3D12PipelineState> mTerrainSkirtPSO = nullptr;
+	ComPtr<ID3D12Resource> mTerrainVBUpload, mTerrainIBUpload;
+	ComPtr<ID3D12Resource> mTerrainVB, mTerrainIB;
+	D3D12_VERTEX_BUFFER_VIEW mTerrainVBV{};
+	D3D12_INDEX_BUFFER_VIEW  mTerrainIBV{};
+	UINT mTerrainIndexCount = 0;
+
+	ComPtr<ID3D12Resource> mTerrainSkirtVB, mTerrainSkirtIB;
+	ComPtr<ID3D12Resource> mTerrainSkirtVBUpload, mTerrainSkirtIBUpload;
+	D3D12_VERTEX_BUFFER_VIEW mTerrainSkirtVBV{};
+	D3D12_INDEX_BUFFER_VIEW  mTerrainSkirtIBV{};
+	UINT mTerrainSkirtIndexCount = 0;
+
+	ComPtr<ID3D12DescriptorHeap> mTerrainHeap; // 4 srv
+
+	enum { kTerrSRV_DiffArr = 0, kTerrSRV_NormArr = 1, kTerrSRV_HeigArr = 2, kTerrSRV_Inst = 3 };
+
+	ComPtr<ID3D12Resource> mDiffuseArray; // Texture2DArray
+	ComPtr<ID3D12Resource> mNormalArray;  // Texture2DArray
+	ComPtr<ID3D12Resource> mHeightArray;  // Texture2DArray
+
+	struct TerrainInstanceGPU {
+		XMFLOAT2 originWS;  float tileSize;   float heightScale;
+		UINT diffSlice;     UINT normSlice;   UINT heightSlice;  float morph; // 0..1
+		XMFLOAT2 uvScale;   XMFLOAT2 pad;
+	};
+	ComPtr<ID3D12Resource> mTerrainInstances; // structured buffer
+	UINT mTerrainInstanceCount = 0;
+	struct TerrainGlobalsCB {
+		UINT  GridRes;
+		float SkirtHeight;
+		float Roughness;
+		float Metallic;
+	};
+	std::unique_ptr<UploadBuffer<TerrainGlobalsCB>> mTerrainGlobalsCB;
+
 
 	//=================================================================PARTICLES
 	ComPtr<ID3D12Resource> mParticlesA;      // default SRV/UAV
@@ -680,6 +770,300 @@ void TexColumnsApp::BuildEnvRootSignature()
 	ThrowIfFailed(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err));
 	ThrowIfFailed(md3dDevice->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
 		IID_PPV_ARGS(&mSkyRootSignature)));
+}
+
+void TexColumnsApp::BuildTerrainRootSignature() {
+	CD3DX12_DESCRIPTOR_RANGE table; table.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0); // t0..t3
+
+	CD3DX12_ROOT_PARAMETER p[3];
+	p[0].InitAsConstantBufferView(0);          // b0 = PassCB
+	p[1].InitAsConstantBufferView(1);          // b1 = TerrainGlobals
+	p[2].InitAsDescriptorTable(1, &table);     // t0..t3 (diff, normal, height, instances)
+
+	auto sams = GetStaticSamplers();
+	CD3DX12_ROOT_SIGNATURE_DESC rsDesc(_countof(p), p, (UINT)sams.size(), sams.data(),
+		D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+	ComPtr<ID3DBlob> sig, err;
+	ThrowIfFailed(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err));
+	ThrowIfFailed(md3dDevice->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+		IID_PPV_ARGS(&mTerrainRootSignature)));
+}
+
+void TexColumnsApp::BuildTerrainGBufferPSO()
+{
+	// float2 grid
+	D3D12_INPUT_ELEMENT_DESC terrIL[] = {
+		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+		  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+	};
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};
+	d.InputLayout = { terrIL, _countof(terrIL) };
+	d.pRootSignature = mTerrainRootSignature.Get();
+
+	d.PS = { mShaders["TerrainPS"]->GetBufferPointer(),
+			 mShaders["TerrainPS"]->GetBufferSize() };
+
+	d.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+	// d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	d.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+	d.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+	d.SampleMask = UINT_MAX;
+	d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+	d.NumRenderTargets = kGBufferCount; // 3
+	d.RTVFormats[0] = mGBufferFormats[0];
+	d.RTVFormats[1] = mGBufferFormats[1];
+	d.RTVFormats[2] = mGBufferFormats[2];
+	d.DSVFormat = mDepthStencilFormat;
+
+	d.SampleDesc.Count = 1;
+	d.SampleDesc.Quality = 0;
+
+	d.VS = { mShaders["TerrainVS"]->GetBufferPointer(),
+			 mShaders["TerrainVS"]->GetBufferSize() };
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+		&d, IID_PPV_ARGS(&mTerrainGBufferPSO)));
+
+	d.VS = { mShaders["TerrainSkirtVS"]->GetBufferPointer(),
+			 mShaders["TerrainSkirtVS"]->GetBufferSize() };
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+		&d, IID_PPV_ARGS(&mTerrainSkirtPSO)));
+}
+
+
+void TexColumnsApp::BuildTerrainGridGeometry(int gridRes) {
+	struct V2 { XMFLOAT2 g; };
+	std::vector<V2> vb; vb.reserve(gridRes * gridRes);
+	for (int y = 0; y < gridRes; ++y)
+		for (int x = 0; x < gridRes; ++x)
+			vb.push_back({ XMFLOAT2((float)x,(float)y) });
+
+	std::vector<uint32_t> ib;
+	ib.reserve((gridRes - 1) * (gridRes - 1) * 6);
+	for (int y = 0; y < gridRes - 1; ++y)
+		for (int x = 0; x < gridRes - 1; ++x) {
+			uint32_t i0 = y * gridRes + x;
+			uint32_t i1 = y * gridRes + (x + 1);
+			uint32_t i2 = (y + 1) * gridRes + x;
+			uint32_t i3 = (y + 1) * gridRes + (x + 1);
+			ib.push_back(i0); ib.push_back(i2); ib.push_back(i1);
+			ib.push_back(i1); ib.push_back(i2); ib.push_back(i3);
+		}
+	mTerrainIndexCount = (UINT)ib.size();
+
+	// upload
+	const UINT vbBytes = (UINT)vb.size() * sizeof(V2);
+	const UINT ibBytes = (UINT)ib.size() * sizeof(uint32_t);
+
+	mTerrainVB = d3dUtil::CreateDefaultBuffer(
+		md3dDevice.Get(), mCommandList.Get(),
+		vb.data(), vbBytes, mTerrainVBUpload);
+
+	mTerrainIB = d3dUtil::CreateDefaultBuffer(
+		md3dDevice.Get(), mCommandList.Get(),
+		ib.data(), ibBytes, mTerrainIBUpload);
+
+	mTerrainVBV.BufferLocation = mTerrainVB->GetGPUVirtualAddress();
+	mTerrainVBV.SizeInBytes = vbBytes;
+	mTerrainVBV.StrideInBytes = sizeof(V2);
+
+	mTerrainIBV.BufferLocation = mTerrainIB->GetGPUVirtualAddress();
+	mTerrainIBV.SizeInBytes = ibBytes;
+	mTerrainIBV.Format = DXGI_FORMAT_R32_UINT;
+}
+
+void TexColumnsApp::BuildTerrainDescriptorsAndPlaceholders()
+{
+	// 0) Heap под t0..t3 (diffuseArr, normalArr, heightArr, instances)
+	D3D12_DESCRIPTOR_HEAP_DESC hd{};
+	hd.NumDescriptors = 4;
+	hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&mTerrainHeap)));
+
+	auto CreateArray1x1RGBA8 = [&](Microsoft::WRL::ComPtr<ID3D12Resource>& outTex,
+		DXGI_FORMAT fmt, uint32_t rgba8888)
+		{
+			auto desc = CD3DX12_RESOURCE_DESC::Tex2D(fmt, 1, 1, /*arraySize=*/1, /*mips=*/1);
+			ThrowIfFailed(md3dDevice->CreateCommittedResource(
+				&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+				D3D12_HEAP_FLAG_NONE, &desc,
+				D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+				IID_PPV_ARGS(&outTex)));
+
+			UINT64 uploadSize = GetRequiredIntermediateSize(outTex.Get(), 0, 1);
+			Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+			ThrowIfFailed(md3dDevice->CreateCommittedResource(
+				&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+				D3D12_HEAP_FLAG_NONE,
+				&CD3DX12_RESOURCE_DESC::Buffer(uploadSize),
+				D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+				IID_PPV_ARGS(&upload)));
+
+			D3D12_SUBRESOURCE_DATA sub{};
+			sub.pData = &rgba8888;
+			sub.RowPitch = 4;
+			sub.SlicePitch = 4;
+
+			UpdateSubresources(mCommandList.Get(), outTex.Get(), upload.Get(), 0, 0, 1, &sub);
+
+			auto toSRV = CD3DX12_RESOURCE_BARRIER::Transition(
+				outTex.Get(),
+				D3D12_RESOURCE_STATE_COPY_DEST,
+				D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+				D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+			mCommandList->ResourceBarrier(1, &toSRV);
+		};
+	CreateArray1x1RGBA8(mDiffuseArray, DXGI_FORMAT_R8G8B8A8_UNORM, 0xFFFFFFFFu);
+	CreateArray1x1RGBA8(mNormalArray, DXGI_FORMAT_R8G8B8A8_UNORM, 0xFF8080FFu);
+	CreateArray1x1RGBA8(mHeightArray, DXGI_FORMAT_R8G8B8A8_UNORM, 0xFF000000u);
+	auto cpu = mTerrainHeap->GetCPUDescriptorHandleForHeapStart();
+	const UINT inc = md3dDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+	auto MakeTex2DArrSRV = [&](ID3D12Resource* r)
+		{
+			D3D12_SHADER_RESOURCE_VIEW_DESC s{};
+			s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			s.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+			s.Format = r->GetDesc().Format;
+			s.Texture2DArray.MostDetailedMip = 0;
+			s.Texture2DArray.MipLevels = r->GetDesc().MipLevels;
+			s.Texture2DArray.FirstArraySlice = 0;
+			s.Texture2DArray.ArraySize = r->GetDesc().DepthOrArraySize;
+			s.Texture2DArray.PlaneSlice = 0;
+			s.Texture2DArray.ResourceMinLODClamp = 0.0f;
+			md3dDevice->CreateShaderResourceView(r, &s, cpu);
+			cpu.ptr += inc;
+		};
+	MakeTex2DArrSRV(mDiffuseArray.Get()); // t0
+	MakeTex2DArrSRV(mNormalArray.Get());  // t1
+	MakeTex2DArrSRV(mHeightArray.Get());  // t2
+
+	{
+		TerrainInstanceGPU inst{};
+		inst.originWS = XMFLOAT2(-25.f, -25.f); 
+		inst.tileSize = 80.f;
+		inst.heightScale = 15.f;                   
+		inst.diffSlice = 0;
+		inst.normSlice = 0;
+		inst.heightSlice = 0;
+		inst.morph = 0.f;
+		inst.uvScale = XMFLOAT2(1.f, 1.f);
+
+		mTerrainInstanceCount = 1;
+
+		const UINT   stride = sizeof(TerrainInstanceGPU);
+		const UINT64 bytes = UINT64(mTerrainInstanceCount) * stride;
+
+		mTerrainInstances = CreateStructuredBuffer(
+			md3dDevice.Get(), mTerrainInstanceCount, stride, D3D12_RESOURCE_STATE_COMMON);
+
+		// upload
+		auto upload = std::make_unique<UploadBuffer<TerrainInstanceGPU>>(md3dDevice.Get(), mTerrainInstanceCount, false);
+		upload->CopyData(0, inst);
+
+		auto toCopy = CD3DX12_RESOURCE_BARRIER::Transition(
+			mTerrainInstances.Get(),
+			D3D12_RESOURCE_STATE_COMMON,
+			D3D12_RESOURCE_STATE_COPY_DEST);
+		mCommandList->ResourceBarrier(1, &toCopy);
+
+		mCommandList->CopyBufferRegion(
+			mTerrainInstances.Get(), 0,
+			upload->Resource(), 0,
+			bytes);
+
+		auto toSRV = CD3DX12_RESOURCE_BARRIER::Transition(
+			mTerrainInstances.Get(),
+			D3D12_RESOURCE_STATE_COPY_DEST,
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		mCommandList->ResourceBarrier(1, &toSRV);
+
+		D3D12_SHADER_RESOURCE_VIEW_DESC s{};
+		s.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+		s.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		s.Format = DXGI_FORMAT_UNKNOWN;
+		s.Buffer.FirstElement = 0;
+		s.Buffer.NumElements = mTerrainInstanceCount;
+		s.Buffer.StructureByteStride = stride;
+		s.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+		md3dDevice->CreateShaderResourceView(mTerrainInstances.Get(), &s, cpu); // t3
+		cpu.ptr += inc;
+	}
+
+	mTerrainGlobalsCB = std::make_unique<UploadBuffer<TerrainGlobalsCB>>(md3dDevice.Get(), 1, true);
+	TerrainGlobalsCB g{};
+	g.GridRes = 256;   
+	g.SkirtHeight = 2.0f;  
+	g.Roughness = 0.7f;
+	g.Metallic = 0.0f;
+	mTerrainGlobalsCB->CopyData(0, g);
+}
+
+void TexColumnsApp::BuildTerrainSkirtGeometry(int gridRes) {
+	struct V2 { XMFLOAT2 g; };
+	std::vector<V2> vb;
+	std::vector<uint32_t> ib;
+
+	//         0: y=0, x:0..res-1
+	//         1: x=res-1, y:0..res-1
+	//         2: y=res-1, x:res-1..0
+	//         3: x=0,     y:res-1..0
+	auto emit_edge = [&](int edge) {
+		int count = gridRes;
+		int base = (int)vb.size();
+
+		auto xy_at = [&](int k)->XMFLOAT2 {
+			switch (edge) {
+			case 0: return XMFLOAT2((float)k, 0.0f);               // south
+			case 1: return XMFLOAT2((float)(gridRes - 1), (float)k);           // east
+			case 2: return XMFLOAT2((float)(gridRes - 1 - k), (float)(gridRes - 1));// north 
+			default:return XMFLOAT2(0.0f, (float)(gridRes - 1 - k));// west  
+			}
+			};
+
+		// top, bottom
+		for (int k = 0; k < count; ++k) {
+			XMFLOAT2 p = xy_at(k);
+			vb.push_back({ p }); // top
+			vb.push_back({ p }); // bottom
+		}
+
+		for (int k = 0; k < count - 1; ++k) {
+			uint32_t top0 = base + 2 * k + 0;
+			uint32_t bot0 = base + 2 * k + 1;
+			uint32_t top1 = base + 2 * (k + 1) + 0;
+			uint32_t bot1 = base + 2 * (k + 1) + 1;
+			ib.push_back(top0); ib.push_back(bot0); ib.push_back(top1);
+			ib.push_back(top1); ib.push_back(bot0); ib.push_back(bot1);
+		}
+		};
+
+	emit_edge(0); emit_edge(1); emit_edge(2); emit_edge(3);
+
+	mTerrainSkirtIndexCount = (UINT)ib.size();
+
+	const UINT vbBytes = (UINT)vb.size() * sizeof(V2);
+	const UINT ibBytes = (UINT)ib.size() * sizeof(uint32_t);
+
+	mTerrainSkirtVB = d3dUtil::CreateDefaultBuffer(
+		md3dDevice.Get(), mCommandList.Get(),
+		vb.data(), vbBytes, mTerrainSkirtVBUpload);
+
+	mTerrainSkirtIB = d3dUtil::CreateDefaultBuffer(
+		md3dDevice.Get(), mCommandList.Get(),
+		ib.data(), ibBytes, mTerrainSkirtIBUpload);
+
+	mTerrainSkirtVBV.BufferLocation = mTerrainSkirtVB->GetGPUVirtualAddress();
+	mTerrainSkirtVBV.SizeInBytes = vbBytes;
+	mTerrainSkirtVBV.StrideInBytes = sizeof(V2);
+
+	mTerrainSkirtIBV.BufferLocation = mTerrainSkirtIB->GetGPUVirtualAddress();
+	mTerrainSkirtIBV.SizeInBytes = ibBytes;
+	mTerrainSkirtIBV.Format = DXGI_FORMAT_R32_UINT;
 }
 
 void TexColumnsApp::BuildEnvPSO() {
@@ -1344,6 +1728,12 @@ bool TexColumnsApp::Initialize()
 	BuildDeferredPSOs();                  //  PSO
 	BuildEnvPSO();
 
+	BuildTerrainRootSignature();
+	BuildTerrainGBufferPSO();
+	BuildTerrainGridGeometry(256); // gridres
+	//BuildTerrainSkirtGeometry(256);
+	BuildTerrainDescriptorsAndPlaceholders();
+
 #ifdef OLDMAP
 	LoadEnvironmentCube(L"../../Textures/skyPrefilter.dds"); // or skybox.dds
 #else
@@ -1516,6 +1906,35 @@ void TexColumnsApp::Draw(const GameTimer& gt)
 	auto& listToDraw = mEnableCulling ? mVisibleOpaqueRitems : mOpaqueRitems;
 	DrawRenderItems(mCommandList.Get(), listToDraw);
 
+	// --- TERRAIN into GBuffer (после опаковых) ---
+	mCommandList->SetPipelineState(mTerrainGBufferPSO.Get());
+	mCommandList->SetGraphicsRootSignature(mTerrainRootSignature.Get());
+
+	// общий PassCB b0
+	auto passRes = mCurrFrameResource->PassCB->Resource();
+	mCommandList->SetGraphicsRootConstantBufferView(0, passRes->GetGPUVirtualAddress());
+	// b1 = TerrainGlobals
+	mCommandList->SetGraphicsRootConstantBufferView(1, mTerrainGlobalsCB->Resource()->GetGPUVirtualAddress());
+
+	// t0..t3 = массивы + инстансы
+	ID3D12DescriptorHeap* terrHeaps[] = { mTerrainHeap.Get() };
+	mCommandList->SetDescriptorHeaps(1, terrHeaps);
+	mCommandList->SetGraphicsRootDescriptorTable(2, mTerrainHeap->GetGPUDescriptorHandleForHeapStart());
+
+	// VB/IB
+	mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	mCommandList->IASetVertexBuffers(0, 1, &mTerrainVBV);
+	mCommandList->IASetIndexBuffer(&mTerrainIBV);
+
+	// рисуем все инстансы
+	mCommandList->DrawIndexedInstanced(mTerrainIndexCount, mTerrainInstanceCount, 0, 0, 0);
+
+	/*mCommandList->SetPipelineState(mTerrainSkirtPSO.Get());
+	mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	mCommandList->IASetVertexBuffers(0, 1, &mTerrainSkirtVBV);
+	mCommandList->IASetIndexBuffer(&mTerrainSkirtIBV);
+	mCommandList->DrawIndexedInstanced(mTerrainSkirtIndexCount, mTerrainInstanceCount, 0, 0, 0);
+	*/
 	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
 		mDepthStencilBuffer.Get(),
 		D3D12_RESOURCE_STATE_DEPTH_WRITE,
@@ -2125,6 +2544,11 @@ void TexColumnsApp::BuildShadersAndInputLayout()
 #endif // PBR
 #endif // DEFERREDQUADS
 
+	mShaders["TerrainVS"] = d3dUtil::CompileShader(L"Shaders\\TerrainGBuffer.hlsl", nullptr, "VS", "vs_5_1");
+	mShaders["TerrainSkirtVS"] = d3dUtil::CompileShader(L"Shaders\\TerrainGBuffer.hlsl", nullptr, "VS_Skirt", "vs_5_1");
+	mShaders["TerrainPS"] = d3dUtil::CompileShader(L"Shaders\\TerrainGBuffer.hlsl", nullptr, "PS", "ps_5_1");
+
+
 	mShaders["SkyVS"] = d3dUtil::CompileShader(L"Shaders\\Sky.hlsl", nullptr, "FullscreenVS", "vs_5_1");
 	mShaders["SkyPS"] = d3dUtil::CompileShader(L"Shaders\\Sky.hlsl", nullptr, "SkyPS", "ps_5_1");
 
@@ -2713,17 +3137,17 @@ void TexColumnsApp::RenderWorld()
 		{} no steps
 	);*/
 
-	AddSublevelToScene("testscene", XMFLOAT3(0, 0, 0));
-	AddSublevelToScene("testscene2", XMFLOAT3(0, 0, 0));
-	RemoveSublevel("testscene2");
-	RemoveSublevel("testscene");
-	//RenderObject("road", "road", "stone", XMMatrixScaling(7, 7, 7), XMMatrixRotationRollPitchYaw(0, 3.14, 0), XMMatrixTranslation(20, -5, -110));
+	//AddSublevelToScene("testscene", XMFLOAT3(0, 0, 0));
+	//AddSublevelToScene("testscene2", XMFLOAT3(0, 0, 0));
+	//RemoveSublevel("testscene2");
+	//RemoveSublevel("testscene");
+	RenderObject("road", "road", "stone", XMMatrixScaling(7, 7, 7), XMMatrixRotationRollPitchYaw(0, 3.14, 0), XMMatrixTranslation(20, -5, -110));
 
-	RenderObject("road", "cubee", "stone", XMMatrixScaling(7, 7, 7), XMMatrixRotationRollPitchYaw(0, MathHelper::Pi/2, 0), XMMatrixTranslation(20, 15, -110));
-	RenderObject("road", "cubee", "stone", XMMatrixScaling(7, 7, 7), XMMatrixRotationRollPitchYaw(0, MathHelper::Pi, 0), XMMatrixTranslation(20, -0, -110));
-	RenderObject("collider", "spheree","stone", 0.1, 0.1, XMMatrixScaling(sphereR, sphereR, sphereR), XMMatrixRotationRollPitchYaw(0, MathHelper::Pi, 0), XMMatrixTranslation(sphereC.x, sphereC.y, sphereC.z));
+	//RenderObject("road", "cubee", "stone", XMMatrixScaling(7, 7, 7), XMMatrixRotationRollPitchYaw(0, MathHelper::Pi/2, 0), XMMatrixTranslation(20, 15, -110));
+	//RenderObject("road", "cubee", "stone", XMMatrixScaling(7, 7, 7), XMMatrixRotationRollPitchYaw(0, MathHelper::Pi, 0), XMMatrixTranslation(20, -0, -110));
+	//RenderObject("collider", "spheree","stone", 0.1, 0.1, XMMatrixScaling(sphereR, sphereR, sphereR), XMMatrixRotationRollPitchYaw(0, MathHelper::Pi, 0), XMMatrixTranslation(sphereC.x, sphereC.y, sphereC.z));
 	//RenderObject("overload", "overloadsphere", "stone", XMMatrixScaling(10, 10, 10), XMMatrixRotationRollPitchYaw(0, 3.14, 0), XMMatrixTranslation(20, -5, -110));
-	/*for (int i = 0; i < 100; i++) {
+	for (int i = 0; i < 100; i++) {
 		std::string baseName = "lodobj" + std::to_string(i);
 		float angle = XMConvertToRadians(45.0f * i);
 		XMMATRIX rot = XMMatrixRotationY(angle);
@@ -2736,7 +3160,7 @@ void TexColumnsApp::RenderWorld()
 			XMMatrixTranslation(20 + i * 5, 0, 50),
 			{ 30.f, 80.f }                   // [0..30) -> L0, [30..80) -> L1, [80..inf) -> L2
 		);
-	}*/
+	}
 
 	for (int i = 1; i < 11; ++i) {
 		for (int j = 1; j < 11; ++j) {
@@ -2744,7 +3168,7 @@ void TexColumnsApp::RenderWorld()
 			//if (i == 10 && j == 10) RenderObject("collider", "cubee", "white", i * 0.1, j * 0.1, XMMatrixScaling(1, 1, 1), XMMatrixRotationRollPitchYaw(0, 0, 0), XMMatrixTranslation(50 - i * 5, 0, 50 - j * 5));;
 		}
 	}
-	RenderObject("text", "text", "stone", XMMatrixScaling(8, 8, 8), XMMatrixRotationRollPitchYaw(0, MathHelper::Pi, 0), XMMatrixTranslation(25, 0, 28));
+	//RenderObject("text", "text", "stone", XMMatrixScaling(8, 8, 8), XMMatrixRotationRollPitchYaw(0, MathHelper::Pi, 0), XMMatrixTranslation(25, 0, 28));
 	RenderObject("text", "cubee", "white", 0.1, 0.99, XMMatrixScaling(10, 10, 10), XMMatrixRotationRollPitchYaw(0, MathHelper::Pi, 0), XMMatrixTranslation(15, 0, -60));
 
 	for (auto& up : mAllRitems) UpdateWorldSphere(up.get());
