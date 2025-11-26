@@ -12,6 +12,10 @@
 #include "d3dUtil.h"
 #include "GameTimer.h"
 
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx12.h"
+
 // Link necessary d3d12 libraries.
 #pragma comment(lib,"d3dcompiler.lib")
 #pragma comment(lib, "D3D12.lib")
@@ -77,6 +81,14 @@ protected:
     void LogAdapters();
     void LogAdapterOutputs(IDXGIAdapter* adapter);
     void LogOutputDisplayModes(IDXGIOutput* output, DXGI_FORMAT format);
+
+protected:
+
+	Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> mImGuiSrvHeap = nullptr;
+
+	void InitImGui();
+	void BeginImGuiFrame();
+	void RenderImGui();
 
 protected:
 

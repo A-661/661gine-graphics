@@ -9,9 +9,14 @@ using Microsoft::WRL::ComPtr;
 using namespace std;
 using namespace DirectX;
 
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
 LRESULT CALLBACK
 MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+
+	if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
+		return true;
 	// Forward hwnd on because we can get messages (e.g., WM_CREATE)
 	// before CreateWindow returns, and thus before mhMainWnd is valid.
     return D3DApp::GetApp()->MsgProc(hwnd, msg, wParam, lParam);
@@ -35,6 +40,10 @@ D3DApp::D3DApp(HINSTANCE hInstance)
 
 D3DApp::~D3DApp()
 {
+	ImGui_ImplDX12_Shutdown();
+	ImGui_ImplWin32_Shutdown();
+	ImGui::DestroyContext();
+
 	if(md3dDevice != nullptr)
 		FlushCommandQueue();
 }
@@ -141,6 +150,8 @@ bool D3DApp::Initialize()
 
     // Do the initial resize code.
     OnResize();
+
+	InitImGui();
 
 	return true;
 }
@@ -719,4 +730,51 @@ void D3DApp::LogOutputDisplayModes(IDXGIOutput* output, DXGI_FORMAT format)
 
         ::OutputDebugString(text.c_str());
     }
+}
+
+void D3DApp::InitImGui()
+{
+	IMGUI_CHECKVERSION();
+	ImGui::CreateContext();
+	ImGui::StyleColorsDark();
+
+	// win32 backend
+	ImGui_ImplWin32_Init(mhMainWnd);
+
+	D3D12_DESCRIPTOR_HEAP_DESC desc = {};
+	desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	desc.NumDescriptors = 1;
+	desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	desc.NodeMask = 0;
+
+	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(
+		&desc, IID_PPV_ARGS(&mImGuiSrvHeap))
+	);
+
+	// dx12 backend
+	ImGui_ImplDX12_Init(
+		md3dDevice.Get(),
+		SwapChainBufferCount,
+		mBackBufferFormat,
+		mImGuiSrvHeap.Get(),
+		mImGuiSrvHeap->GetCPUDescriptorHandleForHeapStart(),
+		mImGuiSrvHeap->GetGPUDescriptorHandleForHeapStart()
+	);
+}
+
+void D3DApp::BeginImGuiFrame()
+{
+	ImGui_ImplDX12_NewFrame();
+	ImGui_ImplWin32_NewFrame();
+	ImGui::NewFrame();
+}
+
+void D3DApp::RenderImGui()
+{
+	ImGui::Render();
+
+	ID3D12DescriptorHeap* heaps[] = { mImGuiSrvHeap.Get() };
+	mCommandList->SetDescriptorHeaps(_countof(heaps), heaps);
+
+	ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), mCommandList.Get());
 }

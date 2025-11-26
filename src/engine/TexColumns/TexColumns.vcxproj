@@ -107,7 +107,7 @@
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>C:\Users\stron\Desktop\intro-to-dx12-master\src\Common;..\..\assimp-master\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\stron\Desktop\intro-to-dx12-master\src\Common;C:\stuff\git repos\661gine-graphics\ThirdParty\imgui;C:\stuff\git repos\661gine-graphics\ThirdParty\imgui\backends</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -143,7 +143,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>C:\Users\stron\Desktop\intro-to-dx12-master\src\Common;</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Users\stron\Desktop\intro-to-dx12-master\src\Common;C:\stuff\git repos\661gine-graphics\ThirdParty\imgui;C:\stuff\git repos\661gine-graphics\ThirdParty\imgui\backends</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -154,6 +154,13 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="..\..\..\ThirdParty\imgui\backends\imgui_impl_dx12.cpp" />
+    <ClCompile Include="..\..\..\ThirdParty\imgui\backends\imgui_impl_win32.cpp" />
+    <ClCompile Include="..\..\..\ThirdParty\imgui\imgui.cpp" />
+    <ClCompile Include="..\..\..\ThirdParty\imgui\imgui_demo.cpp" />
+    <ClCompile Include="..\..\..\ThirdParty\imgui\imgui_draw.cpp" />
+    <ClCompile Include="..\..\..\ThirdParty\imgui\imgui_tables.cpp" />
+    <ClCompile Include="..\..\..\ThirdParty\imgui\imgui_widgets.cpp" />
     <ClCompile Include="..\..\Common\Camera.cpp" />
     <ClCompile Include="..\..\Common\d3dApp.cpp" />
     <ClCompile Include="..\..\Common\d3dUtil.cpp" />
@@ -166,6 +173,10 @@
     <ClCompile Include="661gine.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\..\..\ThirdParty\imgui\backends\imgui_impl_dx12.h" />
+    <ClInclude Include="..\..\..\ThirdParty\imgui\backends\imgui_impl_win32.h" />
+    <ClInclude Include="..\..\..\ThirdParty\imgui\imgui.h" />
+    <ClInclude Include="..\..\..\ThirdParty\imgui\imgui_internal.h" />
     <ClInclude Include="..\..\Common\Camera.h" />
     <ClInclude Include="..\..\Common\d3dApp.h" />
     <ClInclude Include="..\..\Common\d3dUtil.h" />
