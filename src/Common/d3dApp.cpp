@@ -760,6 +760,12 @@ void D3DApp::InitImGui()
 		mImGuiSrvHeap->GetCPUDescriptorHandleForHeapStart(),
 		mImGuiSrvHeap->GetGPUDescriptorHandleForHeapStart()
 	);
+
+	ImGuiIO& io = ImGui::GetIO();
+	io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+	unsigned char* pixels = nullptr;
+	int w = 0, h = 0;
+	io.Fonts->GetTexDataAsRGBA32(&pixels, &w, &h);
 }
 
 void D3DApp::BeginImGuiFrame()
