@@ -22,7 +22,7 @@
 //#define DEBUG
 #define SKYPASS
 #define PBR
-#define OLDMAP
+//#define OLDMAP
 //#define DEFERREDQUADS
 
 Camera cam;
@@ -214,6 +214,9 @@ private:
 		DirectX::XMMATRIX Translation,
 		const std::vector<float>& switchDist);
 
+	void SetupImGuiStyle();
+	void BuildUI();
+
 	std::array<const CD3DX12_STATIC_SAMPLER_DESC, 6> GetStaticSamplers();
 
 private:
@@ -324,6 +327,11 @@ private:
 	ComPtr<ID3D12DescriptorHeap> mGBufferRTVHeap; // RTV for MRT
 	ComPtr<ID3D12DescriptorHeap> mGBufferSRVHeap; // SRV for lighting pass (t0..t2 + t3=depth)
 
+	// UI
+	bool mWireframe = false;
+
+
+
     std::vector<D3D12_INPUT_ELEMENT_DESC> mInputLayout;
  
 	// List of all the render items.
@@ -384,6 +392,24 @@ void TexColumnsApp::SpawnLODObject(
 	}
 
 	mLODGroups[gid] = std::move(grp);
+}
+
+void TexColumnsApp::SetupImGuiStyle()
+{
+	ImGuiStyle& style = ImGui::GetStyle();
+	ImVec4* colors = style.Colors;
+
+	colors[ImGuiCol_WindowBg] = ImVec4(0.09f, 0.39f, 0.30f, 1.0f);
+	colors[ImGuiCol_FrameBg] = ImVec4(0.49f, 0.39f, 0.30f, 1.0f);
+
+	colors[ImGuiCol_Button] = ImVec4(0.18f, 0.22f, 0.30f, 1.0f);
+	colors[ImGuiCol_CheckMark] = ImVec4(0.09f, 0.09f, 0.10f, 1.0f);
+	colors[ImGuiCol_ButtonHovered] = ImVec4(0.26f, 0.34f, 0.48f, 1.0f);
+	colors[ImGuiCol_ButtonActive] = ImVec4(0.20f, 0.45f, 0.65f, 1.0f);
+
+	style.WindowRounding = 1.0f;
+	style.FrameRounding = 3.0f;
+	style.GrabRounding = 3.0f;
 }
 
 BoundingSphere TexColumnsApp::ComputeLocalSphere(MeshGeometry* geo, const SubmeshGeometry& sm) {
@@ -1027,6 +1053,11 @@ void TexColumnsApp::BuildDeferredPSOs()
 	dbg.SampleDesc = { 1,0 };
 	dbg.SampleMask = UINT_MAX;
 	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&dbg, IID_PPV_ARGS(&mPSOs["gbuf_debug_overlay"])));
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC gWireframe = g;
+	gWireframe.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+		&gWireframe, IID_PPV_ARGS(&mPSOs["gbuf_geom_wireframe"])));
 }
 
 void TexColumnsApp::BuildDeferredRootSignature()
@@ -1374,6 +1405,8 @@ bool TexColumnsApp::Initialize()
     RenderWorld();
     BuildFrameResources();
 
+	SetupImGuiStyle();
+
     // Execute the initialization commands.
     ThrowIfFailed(mCommandList->Close());
     ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
@@ -1396,6 +1429,24 @@ void TexColumnsApp::OnResize()
     // The window resized, so update the aspect ratio and recompute the projection matrix.
     XMMATRIX P = XMMatrixPerspectiveFovLH(0.4f*MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
     XMStoreFloat4x4(&mProj, P);
+}
+
+void TexColumnsApp::BuildUI() {
+	BeginImGuiFrame();
+	ImGui::Begin("Debug");
+	ImGui::Text("tam syam");
+	ImGui::Checkbox("Wireframe", &mWireframe);
+	ImGui::Checkbox("ono ono", &mWireframe);
+	ImGui::Text("bems dems");
+	ImGui::End();
+	ImGui::Begin("Broooo");
+	ImGui::Text("tam syam");
+	ImGui::End();
+	ImGui::Begin("Render Item Tree");
+	for (auto& rItem : mAllRitems) {
+		ImGui::Text(rItem->Name.c_str());
+	}
+	ImGui::End();
 }
 
 void TexColumnsApp::Update(const GameTimer& gt)
@@ -1468,13 +1519,16 @@ void TexColumnsApp::Update(const GameTimer& gt)
 	UpdateMaterialCBs(gt);
 	UpdateMainPassCB(gt);
 	BuildVisibleList();
+
+	BuildUI();
 }
 
 void TexColumnsApp::Draw(const GameTimer& gt)
 {
 	auto alloc = mCurrFrameResource->CmdListAlloc;
 	ThrowIfFailed(alloc->Reset());
-	ThrowIfFailed(mCommandList->Reset(alloc.Get(), mPSOs["gbuf_geom"].Get()));
+	auto* gbufPso = mWireframe ? mPSOs["gbuf_geom_wireframe"].Get() : mPSOs["gbuf_geom"].Get(); // TODO: MAKE IN UPDATE/KEY PROCESSING
+	ThrowIfFailed(mCommandList->Reset(alloc.Get(), gbufPso));
 
 	mCommandList->RSSetViewports(1, &mScreenViewport);
 	mCommandList->RSSetScissorRects(1, &mScissorRect);
@@ -1708,8 +1762,11 @@ void TexColumnsApp::Draw(const GameTimer& gt)
 	mCommandList->RSSetScissorRects(1, &prevSc);
 #endif
 
+
 	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
 		CurrentBackBuffer(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
+
+	RenderImGui();
 
 	ThrowIfFailed(mCommandList->Close());
 	ID3D12CommandList* lists[] = { mCommandList.Get() };
