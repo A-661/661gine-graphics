@@ -105,6 +105,20 @@ struct Particle
 };
 static_assert(sizeof(Particle) % 16 == 0, "aligned");
 
+struct AtmosphereConstants
+{
+	DirectX::XMFLOAT3 fogColor;
+	float globalDensity;
+	float heightFalloff;
+	float baseHeight;
+	float fogAnisotropy;
+	float sunIntensity;
+	DirectX::XMFLOAT3 sunDirection;
+	float pad;
+};
+static_assert(sizeof(AtmosphereConstants) % 16 == 0, "aligned");
+
+
 class TexColumnsApp : public D3DApp
 {
 public:
@@ -181,6 +195,9 @@ private:
 	void BuildPostProcessResources();
 	void BuildPostProcessPSO();
 	void BuildPostProcessRootSignature();
+
+	void BuildAtmosphereRootSignature();
+	void BuildAtmospherePSO();
 
 	BoundingSphere ComputeLocalSphere(MeshGeometry* geo, const SubmeshGeometry& sm);
 	void UpdateWorldSphere(RenderItem* ri);
@@ -270,6 +287,7 @@ private:
 	ComPtr<ID3D12Resource>       mLightingTarget;
 	ComPtr<ID3D12DescriptorHeap> mLightingRTVHeap;
 	ComPtr<ID3D12DescriptorHeap> mLightingSRVHeap;
+	bool bSkypass = true;
 
 	// PBR
 	ComPtr<ID3D12Resource> mIrradianceCube;   // DDS cube (low-res)
@@ -285,6 +303,14 @@ private:
 	ComPtr<ID3D12PipelineState> mPostProcessPSO;
 	ComPtr<ID3D12RootSignature> mPostProcessRootSignature;
 	std::unordered_map<std::string, ComPtr<ID3DBlob>> mPostProcessShaders;
+
+	// ATMOSPHERE
+	std::unique_ptr<UploadBuffer<AtmosphereConstants>> mAtmosphereCB;
+	AtmosphereConstants mAtmosphereData{};
+	ComPtr<ID3D12RootSignature> mAtmosphereRootSignature;
+	ComPtr<ID3D12PipelineState> mAtmospherePSO;
+	ComPtr<ID3D12PipelineState> mHeightFogPSO;
+	bool mHeightFogOnly = false;
 
 	// LEVEL STREAMING
 	int mNextSublevelId = 1;
@@ -1178,7 +1204,7 @@ void TexColumnsApp::BuildPostProcessResources()
 		IID_PPV_ARGS(&mPostProcessRenderTarget)));
 
 	// Create RTV heap
-	D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc;
+	D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
 	rtvHeapDesc.NumDescriptors = 1;
 	rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
 	rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
@@ -1192,9 +1218,9 @@ void TexColumnsApp::BuildPostProcessResources()
 	md3dDevice->CreateRenderTargetView(
 		mPostProcessRenderTarget.Get(), nullptr, rtvHandle);
 
-	// Create SRV heap
+	// Create SRV heap // [0] scene color, [1] depth
 	D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-	srvHeapDesc.NumDescriptors = 1;
+	srvHeapDesc.NumDescriptors = 2;
 	srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 	srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(
@@ -1209,8 +1235,23 @@ void TexColumnsApp::BuildPostProcessResources()
 	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	srvDesc.Texture2D.MostDetailedMip = 0;
 	srvDesc.Texture2D.MipLevels = 1;
+
+	// SceneColor = mPostProcessRenderTarget
 	md3dDevice->CreateShaderResourceView(
 		mPostProcessRenderTarget.Get(), &srvDesc, srvHandle);
+
+	// Depth = mDepthStencilBuffer
+	srvHandle.Offset(1, mCbvSrvDescriptorSize);
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC depthSrv = {};
+	depthSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	depthSrv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+	depthSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	depthSrv.Texture2D.MostDetailedMip = 0;
+	depthSrv.Texture2D.MipLevels = 1;
+
+	md3dDevice->CreateShaderResourceView(
+		mDepthStencilBuffer.Get(), &depthSrv, srvHandle);
 }
 
 void TexColumnsApp::BuildPostProcessPSO()
@@ -1284,6 +1325,77 @@ void TexColumnsApp::BuildPostProcessRootSignature()
 		serializedRootSig->GetBufferSize(),
 		IID_PPV_ARGS(&mPostProcessRootSignature)));
 }
+
+void TexColumnsApp::BuildAtmosphereRootSignature()
+{
+	// SceneColor, Depth
+	CD3DX12_DESCRIPTOR_RANGE srvTable;
+	srvTable.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0);
+
+	// [0] b0 = PassCB
+	// [1] b1 = AtmosphereCB
+	// [2] t0-t1 = SRV table
+	CD3DX12_ROOT_PARAMETER params[3];
+	params[0].InitAsConstantBufferView(0);
+	params[1].InitAsConstantBufferView(1);
+	params[2].InitAsDescriptorTable(1, &srvTable, D3D12_SHADER_VISIBILITY_PIXEL);
+
+	auto samplers = GetStaticSamplers();
+	CD3DX12_ROOT_SIGNATURE_DESC rsDesc(
+		_countof(params), params,
+		(UINT)samplers.size(), samplers.data(),
+		D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+	ComPtr<ID3DBlob> sig, err;
+	ThrowIfFailed(D3D12SerializeRootSignature(
+		&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err));
+	ThrowIfFailed(md3dDevice->CreateRootSignature(
+		0, sig->GetBufferPointer(), sig->GetBufferSize(),
+		IID_PPV_ARGS(&mAtmosphereRootSignature)));
+}
+
+void TexColumnsApp::BuildAtmospherePSO()
+{
+	mPostProcessShaders["atmoVS"] = d3dUtil::CompileShader(L"Shaders\\AtmospherePost.hlsl", nullptr, "FullscreenVS", "vs_5_1");
+	mPostProcessShaders["atmoPS"] = d3dUtil::CompileShader(L"Shaders\\AtmospherePost.hlsl", nullptr, "AtmospherePS", "ps_5_1");
+	mPostProcessShaders["heightFogPS"] = d3dUtil::CompileShader(L"Shaders\\AtmospherePost.hlsl", nullptr, "HeightFogPS", "ps_5_1");
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+	psoDesc.InputLayout = { nullptr, 0 }; // fullscreen
+	psoDesc.pRootSignature = mAtmosphereRootSignature.Get();
+	psoDesc.VS = {
+		mPostProcessShaders["atmoVS"]->GetBufferPointer(),
+		mPostProcessShaders["atmoVS"]->GetBufferSize()
+	};
+	psoDesc.PS = {
+		mPostProcessShaders["atmoPS"]->GetBufferPointer(),
+		mPostProcessShaders["atmoPS"]->GetBufferSize()
+	};
+	psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+	psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+	psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
+	psoDesc.DepthStencilState.DepthEnable = FALSE;
+	psoDesc.DepthStencilState.StencilEnable = FALSE;
+	psoDesc.SampleMask = UINT_MAX;
+	psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	psoDesc.NumRenderTargets = 1;
+	psoDesc.RTVFormats[0] = mBackBufferFormat;
+	psoDesc.SampleDesc.Count = 1;
+	psoDesc.SampleDesc.Quality = 0;
+
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+		&psoDesc, IID_PPV_ARGS(&mAtmospherePSO)));
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDescHeightFog = psoDesc;
+	psoDescHeightFog.PS = {
+		mPostProcessShaders["heightFogPS"]->GetBufferPointer(),
+		mPostProcessShaders["heightFogPS"]->GetBufferSize()
+	};
+
+	ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(
+		&psoDescHeightFog, IID_PPV_ARGS(&mHeightFogPSO)));
+}
+
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
     PSTR cmdLine, int showCmd)
@@ -1398,6 +1510,22 @@ bool TexColumnsApp::Initialize()
 	BuildPostProcessRootSignature();
 	BuildPostProcessPSO();
 
+	// TODO MAKE IT BEAUTIFUL LATER
+	mAtmosphereCB = std::make_unique<UploadBuffer<AtmosphereConstants>>(md3dDevice.Get(), 1, true);
+
+	mAtmosphereData.fogColor = XMFLOAT3(0.6f, 0.7f, 0.9f);
+	mAtmosphereData.globalDensity = 0.02f;
+	mAtmosphereData.heightFalloff = 0.25f;
+	mAtmosphereData.baseHeight = 0.0f;
+	mAtmosphereData.fogAnisotropy = 0.0f;
+	mAtmosphereData.sunDirection = XMFLOAT3(0.0f, 1.0f, 0.0f);
+	mAtmosphereData.sunIntensity = 1.0f;
+
+	mAtmosphereCB->CopyData(0, mAtmosphereData);
+
+	BuildAtmosphereRootSignature();
+	BuildAtmospherePSO();
+
 	BuildShapeGeometry();
 
 	BuildMaterials();
@@ -1424,7 +1552,7 @@ void TexColumnsApp::OnResize()
 
 	BuildEnvironmentSRV();
 	BuildIBLSRVs();
-	
+	BuildPostProcessResources();
 
     // The window resized, so update the aspect ratio and recompute the projection matrix.
     XMMATRIX P = XMMatrixPerspectiveFovLH(0.4f*MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
@@ -1436,7 +1564,8 @@ void TexColumnsApp::BuildUI() {
 	ImGui::Begin("Debug");
 	ImGui::Text("tam syam");
 	ImGui::Checkbox("Wireframe", &mWireframe);
-	ImGui::Checkbox("ono ono", &mWireframe);
+	ImGui::Checkbox("Skypass", &bSkypass);
+	ImGui::Checkbox("Heightfog only", &mHeightFogOnly);
 	ImGui::Text("bems dems");
 	ImGui::End();
 	ImGui::Begin("Broooo");
@@ -1446,6 +1575,16 @@ void TexColumnsApp::BuildUI() {
 	for (auto& rItem : mAllRitems) {
 		ImGui::Text(rItem->Name.c_str());
 	}
+	ImGui::End();
+
+	ImGui::Begin("Atmosphere");
+	ImGui::ColorEdit3("Fog Color", &mAtmosphereData.fogColor.x);
+	ImGui::SliderFloat("Global Density", &mAtmosphereData.globalDensity, 0.0f, 0.1f);
+	ImGui::SliderFloat("Height Falloff", &mAtmosphereData.heightFalloff, 0.0f, 5.0f);
+	ImGui::SliderFloat("Base Height", &mAtmosphereData.baseHeight, -100.0f, 100.0f);
+	ImGui::SliderFloat3("Sun Dir", &mAtmosphereData.sunDirection.x, -1.0f, 1.0f);
+	ImGui::SliderFloat("Sun Intensity", &mAtmosphereData.sunIntensity, 0.0f, 20.0f);
+	ImGui::SliderFloat("Fog Anisotropy", &mAtmosphereData.fogAnisotropy, -0.9f, 0.9f);
 	ImGui::End();
 }
 
@@ -1521,6 +1660,16 @@ void TexColumnsApp::Update(const GameTimer& gt)
 	BuildVisibleList();
 
 	BuildUI();
+	{
+		XMVECTOR s = XMLoadFloat3(&mAtmosphereData.sunDirection);
+		if (XMVector3LengthSq(s).m128_f32[0] > 0.0001f) // на всякий
+		{
+			s = XMVector3Normalize(s);
+			XMStoreFloat3(&mAtmosphereData.sunDirection, s);
+		}
+	}
+
+	if (mAtmosphereCB) mAtmosphereCB->CopyData(0, mAtmosphereData);
 }
 
 void TexColumnsApp::Draw(const GameTimer& gt)
@@ -1609,21 +1758,23 @@ void TexColumnsApp::Draw(const GameTimer& gt)
 	mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	mCommandList->DrawInstanced(3, 1, 0, 0);
 
-#ifdef SKYPASS
-	// cubemap pass
-	mCommandList->SetPipelineState(mPSOs["sky"].Get());
-	mCommandList->SetGraphicsRootSignature(mSkyRootSignature.Get());
-	ID3D12DescriptorHeap* skyHeaps[] = { mGBufferSRVHeap.Get() };
-	mCommandList->SetDescriptorHeaps(_countof(skyHeaps), skyHeaps);
-	mCommandList->SetGraphicsRootConstantBufferView(0, passCB->GetGPUVirtualAddress());
-	CD3DX12_GPU_DESCRIPTOR_HANDLE skySrv(mGBufferSRVHeap->GetGPUDescriptorHandleForHeapStart());
-	skySrv.Offset(kSrvIdx_Depth, mCbvSrvDescriptorSize);
-	mCommandList->SetGraphicsRootDescriptorTable(1, skySrv);
-	mCommandList->IASetVertexBuffers(0, 0, nullptr);
-	mCommandList->IASetIndexBuffer(nullptr);
-	mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	mCommandList->DrawInstanced(3, 1, 0, 0);
-#endif // SKYPASS
+
+	if (bSkypass) {
+		// cubemap pass
+		mCommandList->SetPipelineState(mPSOs["sky"].Get());
+		mCommandList->SetGraphicsRootSignature(mSkyRootSignature.Get());
+		ID3D12DescriptorHeap* skyHeaps[] = { mGBufferSRVHeap.Get() };
+		mCommandList->SetDescriptorHeaps(_countof(skyHeaps), skyHeaps);
+		mCommandList->SetGraphicsRootConstantBufferView(0, passCB->GetGPUVirtualAddress());
+		CD3DX12_GPU_DESCRIPTOR_HANDLE skySrv(mGBufferSRVHeap->GetGPUDescriptorHandleForHeapStart());
+		skySrv.Offset(kSrvIdx_Depth, mCbvSrvDescriptorSize);
+		mCommandList->SetGraphicsRootDescriptorTable(1, skySrv);
+		mCommandList->IASetVertexBuffers(0, 0, nullptr);
+		mCommandList->IASetIndexBuffer(nullptr);
+		mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		mCommandList->DrawInstanced(3, 1, 0, 0);
+	}
+
 
 	// particles
 	const bool useA = (mFrameIndex % 2) == 0; // ping-pong here
@@ -1693,16 +1844,43 @@ void TexColumnsApp::Draw(const GameTimer& gt)
 // END OF PARTICLES
 	// mPostProcessRenderTarget -> SRV
 	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
-		mPostProcessRenderTarget.Get(),
-		D3D12_RESOURCE_STATE_RENDER_TARGET,
-		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+        mPostProcessRenderTarget.Get(),
+        D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
 
 	// post -> backbuffer
 	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
-		CurrentBackBuffer(),
-		D3D12_RESOURCE_STATE_PRESENT,
-		D3D12_RESOURCE_STATE_RENDER_TARGET));
+        CurrentBackBuffer(),
+        D3D12_RESOURCE_STATE_PRESENT,
+        D3D12_RESOURCE_STATE_RENDER_TARGET));
 
+	ID3D12PipelineState* atmoPSO = mHeightFogOnly ? mHeightFogPSO.Get() : mAtmospherePSO.Get();
+
+	mCommandList->SetPipelineState(atmoPSO);
+	mCommandList->SetGraphicsRootSignature(mAtmosphereRootSignature.Get());
+
+	ID3D12DescriptorHeap* atmoHeaps[] = { mPostProcessSRVHeap.Get() };
+	mCommandList->SetDescriptorHeaps(_countof(atmoHeaps), atmoHeaps);
+
+	mCommandList->SetGraphicsRootConstantBufferView(0, passCB->GetGPUVirtualAddress());
+
+	mCommandList->SetGraphicsRootConstantBufferView(
+		1, mAtmosphereCB->Resource()->GetGPUVirtualAddress());
+
+	mCommandList->SetGraphicsRootDescriptorTable(
+		2, mPostProcessSRVHeap->GetGPUDescriptorHandleForHeapStart());
+
+	CD3DX12_CPU_DESCRIPTOR_HANDLE backBufferRtv(
+		mRtvHeap->GetCPUDescriptorHandleForHeapStart(),
+		mCurrBackBuffer,
+		mCbvSrvDescriptorSize);
+	mCommandList->OMSetRenderTargets(1, &backBufferRtv, TRUE, nullptr);
+
+	mCommandList->IASetVertexBuffers(0, 0, nullptr);
+	mCommandList->IASetIndexBuffer(nullptr);
+	mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	mCommandList->DrawInstanced(3, 1, 0, 0);
+	/*
 	mCommandList->SetPipelineState(mPostProcessPSO.Get());
 	mCommandList->SetGraphicsRootSignature(mPostProcessRootSignature.Get());
 
@@ -1718,6 +1896,7 @@ void TexColumnsApp::Draw(const GameTimer& gt)
 	mCommandList->IASetIndexBuffer(nullptr);
 	mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	mCommandList->DrawInstanced(3, 1, 0, 0);
+	*/
 
 	// ============================================ DEBUG QUADS
 #ifdef DEBUG
@@ -1989,7 +2168,7 @@ void TexColumnsApp::UpdateMainPassCB(const GameTimer& gt)
 	
     // near/far 
     mMainPassCB.NearZ = 1.0f;
-    mMainPassCB.FarZ  = 100.0f;
+    mMainPassCB.FarZ  = 10000.0f;
 
     mMainPassCB.TotalTime = gt.TotalTime();
     mMainPassCB.DeltaTime = gt.DeltaTime();
