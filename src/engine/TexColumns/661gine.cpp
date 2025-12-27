@@ -198,6 +198,7 @@ private:
 
 	void BuildAtmosphereRootSignature();
 	void BuildAtmospherePSO();
+	void UpdateSun(const GameTimer& gt);
 
 	BoundingSphere ComputeLocalSphere(MeshGeometry* geo, const SubmeshGeometry& sm);
 	void UpdateWorldSphere(RenderItem* ri);
@@ -310,6 +311,7 @@ private:
 	ComPtr<ID3D12RootSignature> mAtmosphereRootSignature;
 	ComPtr<ID3D12PipelineState> mAtmospherePSO;
 	ComPtr<ID3D12PipelineState> mHeightFogPSO;
+	float sunAngularSpeed = 0.1f;
 	bool mHeightFogOnly = false;
 
 	// LEVEL STREAMING
@@ -354,7 +356,8 @@ private:
 	ComPtr<ID3D12DescriptorHeap> mGBufferSRVHeap; // SRV for lighting pass (t0..t2 + t3=depth)
 
 	// UI
-	bool mWireframe = false;
+	bool mWireframe = 0;
+	bool bShowParticles = 1;
 
 
 
@@ -1562,14 +1565,15 @@ void TexColumnsApp::OnResize()
 void TexColumnsApp::BuildUI() {
 	BeginImGuiFrame();
 	ImGui::Begin("Debug");
-	ImGui::Text("tam syam");
+	ImGui::Text("View:");
 	ImGui::Checkbox("Wireframe", &mWireframe);
+	ImGui::RadioButton("Atmosphere", !mHeightFogOnly);
+	if (ImGui::IsItemClicked()) mHeightFogOnly = 0;
+	ImGui::RadioButton("Height Fog Only", mHeightFogOnly);
+	if (ImGui::IsItemClicked()) mHeightFogOnly = 1;
+	ImGui::Text("\nPasses:");
 	ImGui::Checkbox("Skypass", &bSkypass);
-	ImGui::Checkbox("Heightfog only", &mHeightFogOnly);
-	ImGui::Text("bems dems");
-	ImGui::End();
-	ImGui::Begin("Broooo");
-	ImGui::Text("tam syam");
+	ImGui::Checkbox("Particles", &bShowParticles);
 	ImGui::End();
 	ImGui::Begin("Render Item Tree");
 	for (auto& rItem : mAllRitems) {
@@ -1582,10 +1586,22 @@ void TexColumnsApp::BuildUI() {
 	ImGui::SliderFloat("Global Density", &mAtmosphereData.globalDensity, 0.0f, 0.1f);
 	ImGui::SliderFloat("Height Falloff", &mAtmosphereData.heightFalloff, 0.0f, 5.0f);
 	ImGui::SliderFloat("Base Height", &mAtmosphereData.baseHeight, -100.0f, 100.0f);
+	ImGui::SliderFloat("Angular Speed", &sunAngularSpeed, 0.0f, 1.0f);
 	ImGui::SliderFloat3("Sun Dir", &mAtmosphereData.sunDirection.x, -1.0f, 1.0f);
 	ImGui::SliderFloat("Sun Intensity", &mAtmosphereData.sunIntensity, 0.0f, 20.0f);
 	ImGui::SliderFloat("Fog Anisotropy", &mAtmosphereData.fogAnisotropy, -0.9f, 0.9f);
 	ImGui::End();
+}
+
+void TexColumnsApp::UpdateSun(const GameTimer& gt) {
+	float time = gt.TotalTime();
+	float theta = time * sunAngularSpeed;
+	XMFLOAT3 sunDir;
+	sunDir.x = cosf(theta);
+	sunDir.y = sinf(theta);
+	sunDir.z = 0.2f;
+	XMVECTOR v = XMVector3Normalize(XMLoadFloat3(&sunDir));
+	XMStoreFloat3(&mAtmosphereData.sunDirection, v);
 }
 
 void TexColumnsApp::Update(const GameTimer& gt)
@@ -1625,20 +1641,7 @@ void TexColumnsApp::Update(const GameTimer& gt)
 
 
 	UpdateCamera(gt);
-	for (auto& rItem : mAllRitems)
-	{
-		if (rItem->Name == "eyeL")
-		{
-
-			XMStoreFloat4x4(&rItem->World,XMMatrixScaling(3, 3, 3)* leftRotation * XMMatrixTranslation(0.63,3.9,1.1));
-			rItem->NumFramesDirty = gNumFrameResources;
-		}
-		if (rItem->Name == "eyeR")
-		{
-			XMStoreFloat4x4(&rItem->World, XMMatrixScaling(3, 3, 3) * rightRotation * XMMatrixTranslation(-0.63, 3.9, 1.1));
-			rItem->NumFramesDirty = gNumFrameResources;
-		}
-	}
+	
     // Cycle through the circular frame resource array.
     mCurrFrameResourceIndex = (mCurrFrameResourceIndex + 1) % gNumFrameResources;
     mCurrFrameResource = mFrameResources[mCurrFrameResourceIndex].get();
@@ -1668,6 +1671,7 @@ void TexColumnsApp::Update(const GameTimer& gt)
 			XMStoreFloat3(&mAtmosphereData.sunDirection, s);
 		}
 	}
+	UpdateSun(gt);
 
 	if (mAtmosphereCB) mAtmosphereCB->CopyData(0, mAtmosphereData);
 }
@@ -1811,35 +1815,37 @@ void TexColumnsApp::Draw(const GameTimer& gt)
 	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(outRes,
 		D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
 		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+	if (bShowParticles) {
+		//  buildboard render on mPostProcessRenderTarget /w depth-test
+		mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+			mDepthStencilBuffer.Get(),
+			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+			D3D12_RESOURCE_STATE_DEPTH_READ));
 
-	//  buildboard render on mPostProcessRenderTarget /w depth-test
-	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
-		mDepthStencilBuffer.Get(),
-		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-		D3D12_RESOURCE_STATE_DEPTH_READ));
+		// same RTV
+		mCommandList->SetPipelineState(mParticleGfx_PSO.Get());
+		mCommandList->SetGraphicsRootSignature(mParticleGfx_RS.Get());
+		mCommandList->IASetVertexBuffers(0, 0, nullptr);
+		mCommandList->IASetIndexBuffer(nullptr);
+		mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
-	// same RTV
-	mCommandList->SetPipelineState(mParticleGfx_PSO.Get());
-	mCommandList->SetGraphicsRootSignature(mParticleGfx_RS.Get());
-	mCommandList->IASetVertexBuffers(0, 0, nullptr);
-	mCommandList->IASetIndexBuffer(nullptr);
-	mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-
-	mCommandList->SetGraphicsRootConstantBufferView(0, mCurrFrameResource->PassCB->Resource()->GetGPUVirtualAddress());
+		mCommandList->SetGraphicsRootConstantBufferView(0, mCurrFrameResource->PassCB->Resource()->GetGPUVirtualAddress());
 
 
-	// t0 = particles (outRes), t1 = sprite
-	mCommandList->SetGraphicsRootDescriptorTable(1, gpuAt(useA ? kSRV_B : kSRV_A)); // t0
-	mCommandList->SetGraphicsRootDescriptorTable(2, gpuAt(kSRV_Sprite));           // t1
+		// t0 = particles (outRes), t1 = sprite
+		mCommandList->SetGraphicsRootDescriptorTable(1, gpuAt(useA ? kSRV_B : kSRV_A)); // t0
+		mCommandList->SetGraphicsRootDescriptorTable(2, gpuAt(kSRV_Sprite));           // t1
 
-	mCommandList->OMSetRenderTargets(1, &mPostProcessRTVHeap->GetCPUDescriptorHandleForHeapStart(), TRUE, &DepthStencilView());
+		mCommandList->OMSetRenderTargets(1, &mPostProcessRTVHeap->GetCPUDescriptorHandleForHeapStart(), TRUE, &DepthStencilView());
 
-	mCommandList->DrawInstanced(4, mParticleCount, 0, 0);
+		mCommandList->DrawInstanced(4, mParticleCount, 0, 0);
 
-	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
-		mDepthStencilBuffer.Get(),
-		D3D12_RESOURCE_STATE_DEPTH_READ,
-		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+		mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+			mDepthStencilBuffer.Get(),
+			D3D12_RESOURCE_STATE_DEPTH_READ,
+			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+	}
+	
 
 // END OF PARTICLES
 	// mPostProcessRenderTarget -> SRV
@@ -1974,7 +1980,7 @@ void TexColumnsApp::OnMouseUp(WPARAM btnState, int x, int y)
 
 void TexColumnsApp::OnMouseMove(WPARAM btnState, int x, int y)
 {
-	if ((btnState & MK_LBUTTON) != 0)
+	if ((btnState & MK_RBUTTON) != 0)
 	{
 		// Make each pixel correspond to a quarter of a degree.
 		float dx = XMConvertToRadians(0.25f * static_cast<float>(x - mLastMousePos.x));
